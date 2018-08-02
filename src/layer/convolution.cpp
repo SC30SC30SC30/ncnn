@@ -24,6 +24,15 @@ Convolution::Convolution()
 {
     one_blob_only = true;
     support_inplace = false;
+
+    quantize = 0;
+    dequantize = 0;
+}
+
+Convolution::~Convolution()
+{
+    delete quantize;
+    delete dequantize;
 }
 
 int Convolution::load_param(const ParamDict& pd)
@@ -39,6 +48,9 @@ int Convolution::load_param(const ParamDict& pd)
     pad_h = pd.get(14, pad_w);
     bias_term = pd.get(5, 0);
     weight_data_size = pd.get(6, 0);
+    weight_data_int8_scale = pd.get(8, 0.f);
+
+    use_int8_inference = pd.use_int8_inference;
 
     return 0;
 }
@@ -56,10 +68,50 @@ int Convolution::load_model(const ModelBin& mb)
             return -100;
     }
 
+    bool weight_data_is_int8 = (weight_data.elemsize == (size_t)1u);
+    bool weight_data_is_float32 = (weight_data.elemsize == (size_t)4u);
+
+    if (weight_data_is_int8 && !use_int8_inference)
+    {
+        fprintf(stderr, "quantized int8 weight loaded but use_int8_inference disabled\n");
+        return -1;
+    }
+
+    if (use_int8_inference)
+    {
+        quantize = ncnn::create_layer(ncnn::LayerType::Quantize);
+        dequantize = ncnn::create_layer(ncnn::LayerType::Dequantize);
+    }
+
+    if (weight_data_is_float32 && use_int8_inference)
+    {
+        if (weight_data_int8_scale != 0.f)
+        {
+            // quantize weight to int8
+            ncnn::ParamDict pd;
+            pd.set(0, weight_data_int8_scale);// scale
+
+            quantize->load_param(pd);
+
+            Mat int8_weight_data;
+            quantize->forward(weight_data, int8_weight_data);
+
+            if (int8_weight_data.empty())
+                return -100;
+
+            weight_data = int8_weight_data;
+        }
+        else
+        {
+            // plain float32 weight, fallback to float32 inference
+            use_int8_inference = false;
+        }
+    }
+
     return 0;
 }
 
-int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
+int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
     // convolv with NxN kernel
     // value = value + bias
@@ -78,6 +130,9 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
             pd.set(0, num_output);
             pd.set(1, bias_term);
             pd.set(2, weight_data_size);
+            pd.set(8, weight_data_int8_scale);
+
+            pd.use_int8_inference = use_int8_inference;
 
             op->load_param(pd);
 
@@ -89,7 +144,7 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
             op->load_model(ModelBinFromMatArray(weights));
 
             // forward
-            op->forward(bottom_blob, top_blob);
+            op->forward(bottom_blob, top_blob, opt);
 
             delete op;
 
@@ -100,6 +155,7 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
 
 //     fprintf(stderr, "Convolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d\n", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
 
@@ -109,7 +165,7 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
     Mat bottom_blob_bordered = bottom_blob;
     if (pad_w > 0 || pad_h > 0)
     {
-        copy_make_border(bottom_blob, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f);
+        copy_make_border(bottom_blob, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
         if (bottom_blob_bordered.empty())
             return -100;
 
@@ -122,7 +178,7 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
         int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
         if (wpad > 0 || hpad > 0)
         {
-            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f);
+            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
             if (bottom_blob_bordered.empty())
                 return -100;
         }
@@ -134,7 +190,7 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
     int outw = (w - kernel_extent_w) / stride_w + 1;
     int outh = (h - kernel_extent_h) / stride_h + 1;
 
-    top_blob.create(outw, outh, num_output);
+    top_blob.create(outw, outh, num_output, elemsize, opt.blob_allocator);
     if (top_blob.empty())
         return -100;
 
@@ -159,8 +215,87 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob) const
         }
     }
 
+    if (use_int8_inference)
+    {
+        Mat bottom_blob_bordered_int8;
+        bottom_blob_bordered_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
+        if (bottom_blob_bordered_int8.empty())
+            return -100;
+
+        float bottom_scale = opt.int8_scales[0];
+//         fprintf(stderr, "bottom_scale = %f\n", bottom_scale);
+
+        // quantize, scale and round to nearest
+        {
+            ncnn::ParamDict pd;
+            pd.set(0, bottom_scale);// scale
+
+            quantize->load_param(pd);
+
+            quantize->forward(bottom_blob_bordered, bottom_blob_bordered_int8, opt);
+        }
+
+        // num_output
+        #pragma omp parallel for num_threads(opt.num_threads)
+        for (int p=0; p<num_output; p++)
+        {
+            int* outptr = top_blob.channel(p);
+
+            for (int i = 0; i < outh; i++)
+            {
+                for (int j = 0; j < outw; j++)
+                {
+                    int sum = 0;
+
+                    const signed char* kptr = (const signed char*)weight_data + maxk * channels * p;
+
+                    // channels
+                    for (int q=0; q<channels; q++)
+                    {
+                        const Mat m = bottom_blob_bordered_int8.channel(q);
+                        const signed char* sptr = m.row<signed char>(i*stride_h) + j*stride_w;
+
+                        for (int k = 0; k < maxk; k++)
+                        {
+                            int val = sptr[ space_ofs[k] ];
+                            int w = kptr[k];
+                            sum += val * w;
+                        }
+
+                        kptr += maxk;
+                    }
+
+                    outptr[j] = sum;
+                }
+
+                outptr += outw;
+            }
+        }
+
+        // dequantize, reverse scale inplace
+        {
+            float top_rescale = 1.f / (bottom_scale * weight_data_int8_scale);
+
+            ncnn::ParamDict pd;
+            pd.set(0, top_rescale);// scale
+            pd.set(1, bias_term);// bias_term
+            pd.set(2, num_output);// bias_data_size
+
+            dequantize->load_param(pd);
+
+            ncnn::Mat weights[1];
+            weights[0] = bias_data;
+
+            dequantize->load_model(ModelBinFromMatArray(weights));
+
+            dequantize->forward_inplace(top_blob, opt);
+        }
+
+        return 0;
+    }
+
     // num_output
-    #pragma omp parallel for
+    #pragma omp parallel for num_threads(opt.num_threads)
     for (int p=0; p<num_output; p++)
     {
         float* outptr = top_blob.channel(p);

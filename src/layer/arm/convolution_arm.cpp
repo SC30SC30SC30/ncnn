@@ -23,6 +23,10 @@ namespace ncnn {
 #include "convolution_5x5.h"
 #include "convolution_7x7.h"
 
+#if !__aarch64__
+#include "convolution_1x1_int8.h"
+#endif // !__aarch64__
+
 DEFINE_LAYER_CREATOR(Convolution_arm)
 
 int Convolution_arm::load_param(const ParamDict& pd)
@@ -34,7 +38,7 @@ int Convolution_arm::load_param(const ParamDict& pd)
     use_winograd3x3 = false;
     use_sgemm1x1 = false;
 
-    if (kernel_w == 3 && kernel_h == 3 && dilation_w == 1 && dilation_h == 1 && stride_w == 1 && stride_h == 1)
+    if (pd.use_winograd_convolution && kernel_w == 3 && kernel_h == 3 && dilation_w == 1 && dilation_h == 1 && stride_w == 1 && stride_h == 1)
     {
         int num_input = weight_data_size / 9 / num_output;
         // winograd is slow on small channel count
@@ -43,10 +47,10 @@ int Convolution_arm::load_param(const ParamDict& pd)
     }
 
     // TODO assume more proper condition
-    if (kernel_w == 1 && kernel_h == 1 && dilation_w == 1 && dilation_h == 1 && stride_w == 1 && stride_h == 1)
+    if (pd.use_sgemm_convolution && kernel_w == 1 && kernel_h == 1 && dilation_w == 1 && dilation_h == 1 && stride_w == 1 && stride_h == 1)
     {
         int num_input = weight_data_size / num_output;
-        if (num_input >= 16 && num_output >= 16)
+        if (num_input >= 64 && num_output >= 64)
             use_sgemm1x1 = true;
     }
 
@@ -58,6 +62,11 @@ int Convolution_arm::load_model(const ModelBin& mb)
     int ret = Convolution::load_model(mb);
     if (ret != 0)
         return ret;
+
+    if (use_int8_inference)
+    {
+        return 0;
+    }
 
     if (use_winograd3x3)
     {
@@ -75,10 +84,11 @@ int Convolution_arm::load_model(const ModelBin& mb)
     return 0;
 }
 
-int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv_func conv) const
+int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv_func conv, const Option& opt) const
 {
     int w = bottom_blob.w;
     int h = bottom_blob.h;
+    size_t elemsize = bottom_blob.elemsize;
 
     const int kernel_size = kernel_w;
     const int stride = stride_w;
@@ -88,7 +98,7 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
     Mat bottom_blob_bordered = bottom_blob;
     if (pad_w > 0 || pad_h > 0)
     {
-        copy_make_border(bottom_blob, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f);
+        copy_make_border(bottom_blob, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
         if (bottom_blob_bordered.empty())
             return -100;
 
@@ -101,7 +111,7 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
         int hpad = kernel_extent + (h - 1) / stride * stride - h;
         if (wpad > 0 || hpad > 0)
         {
-            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f);
+            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
             if (bottom_blob_bordered.empty())
                 return -100;
         }
@@ -113,7 +123,7 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
     int outw = (w - kernel_extent) / stride + 1;
     int outh = (h - kernel_extent) / stride + 1;
 
-    top_blob.create(outw, outh, num_output);
+    top_blob.create(outw, outh, num_output, elemsize, opt.blob_allocator);
     if (top_blob.empty())
         return -100;
 
@@ -132,7 +142,7 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
 
             if (inner_bottom_blob.w != inner_w || inner_bottom_blob.h != inner_h)
             {
-                inner_bottom_blob.create(inner_w, inner_h, bottom_blob.c);
+                inner_bottom_blob.create(inner_w, inner_h, bottom_blob.c, elemsize, opt.workspace_allocator);
 
                 if (inner_bottom_blob.empty())
                 {
@@ -142,7 +152,7 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
 
             if (inner_top_blob.w != inner_outw || inner_top_blob.h != inner_outh)
             {
-                inner_top_blob.create(inner_outw, inner_outh, num_output);
+                inner_top_blob.create(inner_outw, inner_outh, num_output, elemsize, opt.workspace_allocator);
 
                 if (inner_top_blob.empty())
                 {
@@ -150,7 +160,7 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
                 }
             }
 
-            #pragma omp parallel for
+            #pragma omp parallel for num_threads(opt.num_threads)
             for (int c = 0; c < bottom_blob.c; c ++)
             {
                 float *outptr = (float *) inner_bottom_blob.channel(c);
@@ -166,9 +176,9 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
                 }
             }
 
-            conv(inner_bottom_blob, inner_top_blob, weight_data, bias_data);
+            conv(inner_bottom_blob, inner_top_blob, weight_data, bias_data, opt);
 
-            #pragma omp parallel for
+            #pragma omp parallel for num_threads(opt.num_threads)
             for (int c = 0; c < num_output; c ++)
             {
                 float *outptr = (float *) top_blob.channel(c) + x * outw + y;
@@ -188,19 +198,19 @@ int Convolution_arm::forwardDilation(const Mat& bottom_blob, Mat& top_blob, conv
     return 0;
 }
 
-int Convolution_arm::forward(const Mat& bottom_blob, Mat& top_blob) const
+int Convolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
     // convolv with NxN kernel
     // value = value + bias
 
     if (bottom_blob.dims != 3)
     {
-        return Convolution::forward(bottom_blob, top_blob);
+        return Convolution::forward(bottom_blob, top_blob, opt);
     }
 
     if (kernel_w != kernel_h || stride_w != stride_h)
     {
-        return Convolution::forward(bottom_blob, top_blob);
+        return Convolution::forward(bottom_blob, top_blob, opt);
     }
 
     const int kernel_size = kernel_w;
@@ -208,10 +218,23 @@ int Convolution_arm::forward(const Mat& bottom_blob, Mat& top_blob) const
 
     if (kernel_size > 7 || stride > 4 || dilation_w != dilation_h)
     {
-        return Convolution::forward(bottom_blob, top_blob);
+        return Convolution::forward(bottom_blob, top_blob, opt);
     }
 
-    typedef void (*conv_func)(const Mat&, Mat&, const Mat&, const Mat&);
+#if __aarch64__
+    if (use_int8_inference)
+    {
+        // TODO
+        return Convolution::forward(bottom_blob, top_blob, opt);
+    }
+#else
+    if (use_int8_inference && (kernel_size != 1 || stride != 1))
+    {
+        return Convolution::forward(bottom_blob, top_blob, opt);
+    }
+#endif
+
+    typedef void (*conv_func)(const Mat&, Mat&, const Mat&, const Mat&, const Option&);
 
     // kernel_size x stride
     conv_func conv_func_table[7][4] =
@@ -260,25 +283,34 @@ int Convolution_arm::forward(const Mat& bottom_blob, Mat& top_blob) const
         }  // kernel_size = 7
     };
 
-    conv_func conv = conv_func_table[kernel_size-1][stride-1];
-    if (!conv)
-    {
-        return Convolution::forward(bottom_blob, top_blob);
-    }
+    conv_func conv = 0;
 
-    if (dilation_w != 1)
+    if (use_int8_inference)
     {
-        return forwardDilation(bottom_blob, top_blob, conv);
+    }
+    else
+    {
+        conv = conv_func_table[kernel_size-1][stride-1];
+        if (!conv)
+        {
+            return Convolution::forward(bottom_blob, top_blob, opt);
+        }
+
+        if (dilation_w != 1)
+        {
+            return forwardDilation(bottom_blob, top_blob, conv, opt);
+        }
     }
 
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
 
     Mat bottom_blob_bordered = bottom_blob;
     if (pad_w > 0 || pad_h > 0)
     {
-        copy_make_border(bottom_blob, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f);
+        copy_make_border(bottom_blob, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
         if (bottom_blob_bordered.empty())
             return -100;
 
@@ -291,7 +323,7 @@ int Convolution_arm::forward(const Mat& bottom_blob, Mat& top_blob) const
         int hpad = kernel_size + (h - 1) / stride * stride - h;
         if (wpad > 0 || hpad > 0)
         {
-            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f);
+            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
             if (bottom_blob_bordered.empty())
                 return -100;
         }
@@ -303,22 +335,69 @@ int Convolution_arm::forward(const Mat& bottom_blob, Mat& top_blob) const
     int outw = (w - kernel_size) / stride + 1;
     int outh = (h - kernel_size) / stride + 1;
 
-    top_blob.create(outw, outh, num_output);
+    top_blob.create(outw, outh, num_output, elemsize, opt.blob_allocator);
     if (top_blob.empty())
         return -100;
 
+#if !__aarch64__
+    if (use_int8_inference)
+    {
+        // kernel_size = 1
+        // stride = 1
+        Mat bottom_blob_bordered_int8;
+        bottom_blob_bordered_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
+        if (bottom_blob_bordered_int8.empty())
+            return -100;
+
+        float bottom_scale = opt.int8_scales[0];
+//         fprintf(stderr, "bottom_scale = %f\n", bottom_scale);
+
+        // quantize, scale and round to nearest
+        {
+            ncnn::ParamDict pd;
+            pd.set(0, bottom_scale);// scale
+
+            quantize->load_param(pd);
+
+            quantize->forward(bottom_blob_bordered, bottom_blob_bordered_int8, opt);
+        }
+
+        conv1x1s1_neon_s8_inter(bottom_blob_bordered_int8, top_blob, weight_data, opt);
+
+        // dequantize, reverse scale inplace
+        {
+            float top_rescale = 1.f / (bottom_scale * weight_data_int8_scale);
+
+            ncnn::ParamDict pd;
+            pd.set(0, top_rescale);// scale
+            pd.set(1, bias_term);// bias_term
+            pd.set(2, num_output);// bias_data_size
+
+            dequantize->load_param(pd);
+
+            ncnn::Mat weights[1];
+            weights[0] = bias_data;
+
+            dequantize->load_model(ModelBinFromMatArray(weights));
+
+            dequantize->forward_inplace(top_blob, opt);
+        }
+
+        return 0;
+    }
+#endif
+
     if (use_winograd3x3 && w <= 120 && h <= 120)
     {
-//         conv3x3s1_winograd64_neon4(bottom_blob_bordered, top_blob, weight_3x3_winograd64_data, bias_data);
-        conv3x3s1_winograd64_neon5(bottom_blob_bordered, top_blob, weight_3x3_winograd64_data, bias_data);
+//         conv3x3s1_winograd64_neon4(bottom_blob_bordered, top_blob, weight_3x3_winograd64_data, bias_data, opt);
+        conv3x3s1_winograd64_neon5(bottom_blob_bordered, top_blob, weight_3x3_winograd64_data, bias_data, opt);
     }
-    else if (use_sgemm1x1 && w <= 120 && h <= 120)
+    else if (use_sgemm1x1)
     {
-        // TODO assume more proper condition
-        conv1x1s1_sgemm_neon(bottom_blob_bordered, top_blob, weight_1x1_sgemm_data, bias_data);
+        conv1x1s1_sgemm_neon(bottom_blob_bordered, top_blob, weight_1x1_sgemm_data, bias_data, opt);
     }
     else
-        conv(bottom_blob_bordered, top_blob, weight_data, bias_data);
+        conv(bottom_blob_bordered, top_blob, weight_data, bias_data, opt);
 
     return 0;
 }

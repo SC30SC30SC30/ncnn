@@ -8,6 +8,7 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/layer)
 
 set(ncnn_SRCS
+    allocator.cpp
     blob.cpp
     cpu.cpp
     layer.cpp
@@ -145,11 +146,16 @@ ncnn_add_layer(DeconvolutionDepthWise)
 ncnn_add_layer(ShuffleChannel)
 ncnn_add_layer(InstanceNorm)
 ncnn_add_layer(Clip)
+ncnn_add_layer(Reorg)
+ncnn_add_layer(YoloDetectionOutput)
+ncnn_add_layer(Quantize)
+ncnn_add_layer(Dequantize)
 
 add_library(ncnn STATIC ${ncnn_SRCS})
 
 install(TARGETS ncnn ARCHIVE DESTINATION lib)
 install(FILES
+    allocator.h
     blob.h
     cpu.h
     layer.h

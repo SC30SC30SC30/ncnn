@@ -24,7 +24,7 @@ namespace ncnn {
 
 DEFINE_LAYER_CREATOR(DeconvolutionDepthWise_arm)
 
-int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob) const
+int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
     // convolv with NxN kernel
     // value = value + bias
@@ -32,6 +32,7 @@ int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob) c
     int w = bottom_blob.w;
     int h = bottom_blob.h;
     int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
 
     if (channels % group != 0 || num_output % group != 0)
     {
@@ -45,10 +46,20 @@ int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob) c
     int outw = (w - 1) * stride_w + kernel_extent_w;
     int outh = (h - 1) * stride_h + kernel_extent_h;
 
-    Mat top_blob_bordered = top_blob;
-    top_blob_bordered.create(outw, outh, num_output);
-    if (top_blob_bordered.empty())
-        return -100;
+    Mat top_blob_bordered;
+    if (pad_w > 0 || pad_h > 0)
+    {
+        top_blob_bordered.create(outw, outh, num_output, elemsize, opt.workspace_allocator);
+        if (top_blob_bordered.empty())
+            return -100;
+    }
+    else
+    {
+        top_blob_bordered = top_blob;
+        top_blob_bordered.create(outw, outh, num_output, elemsize, opt.blob_allocator);
+        if (top_blob_bordered.empty())
+            return -100;
+    }
 
     const int maxk = kernel_w * kernel_h;
 
@@ -60,11 +71,11 @@ int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob) c
         omp_set_nested(0);
 #endif
 
-        #pragma omp parallel for
+        #pragma omp parallel for num_threads(opt.num_threads)
         for (int g=0; g<group; g++)
         {
             Mat bottom_blob_g(w, h, 1, bottom_blob.channel(g).data);
-            Mat top_blob_bordered_g(outw, outh, 1, top_blob_bordered.channel(g));
+            Mat top_blob_bordered_g(outw, outh, 1, top_blob_bordered.channel(g), top_blob.elemsize, top_blob.allocator);
             Mat weight_data_g(maxk, (void*)((const float*)weight_data + maxk * g));
 
             Mat bias_data_g;
@@ -98,7 +109,7 @@ int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob) c
             op->load_model(ModelBinFromMatArray(weights));
 
             // forward
-            op->forward(bottom_blob_g, top_blob_bordered_g);
+            op->forward(bottom_blob_g, top_blob_bordered_g, opt);
 
             delete op;
         }
@@ -115,7 +126,7 @@ int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob) c
         for (int g=0; g<group; g++)
         {
             Mat bottom_blob_g(w, h, channels_g, bottom_blob.channel(channels_g * g).data);
-            Mat top_blob_bordered_g(outw, outh, num_output_g, top_blob_bordered.channel(num_output_g * g));
+            Mat top_blob_bordered_g(outw, outh, num_output_g, top_blob_bordered.channel(num_output_g * g), top_blob.elemsize, top_blob.allocator);
             Mat weight_data_g(maxk * channels_g * num_output_g, (void*)((const float*)weight_data + maxk * channels_g * num_output_g * g));
             Mat bias_data_g;
             if (bias_term)
@@ -148,22 +159,24 @@ int DeconvolutionDepthWise_arm::forward(const Mat& bottom_blob, Mat& top_blob) c
             op->load_model(ModelBinFromMatArray(weights));
 
             // forward
-            op->forward(bottom_blob_g, top_blob_bordered_g);
+            op->forward(bottom_blob_g, top_blob_bordered_g, opt);
 
             delete op;
         }
     }
 
-    top_blob = top_blob_bordered;
-
     if (pad_w > 0 || pad_h > 0)
     {
-        copy_cut_border(top_blob_bordered, top_blob, pad_h, pad_h, pad_w, pad_w);
+        copy_cut_border(top_blob_bordered, top_blob, pad_h, pad_h, pad_w, pad_w, opt.blob_allocator, opt.num_threads);
         if (top_blob.empty())
             return -100;
 
         outw = top_blob.w;
         outh = top_blob.h;
+    }
+    else
+    {
+        top_blob = top_blob_bordered;
     }
 
     return 0;

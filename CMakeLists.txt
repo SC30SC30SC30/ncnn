@@ -38,11 +38,12 @@ endif()
 
 if(WIN32)
     add_definitions(-D_SCL_SECURE_NO_WARNINGS -D_CRT_SECURE_NO_DEPRECATE)
+    add_definitions(-DNOMINMAX)
 else()
     add_definitions(-Wall -Wextra -Wno-unused-function)
 
+    add_definitions(-fPIC)
     if(CMAKE_BUILD_TYPE MATCHES "(Release|RELEASE|release)")
-        add_definitions(-fPIC)
         add_definitions(-Ofast)
 
         add_definitions(-ffast-math)

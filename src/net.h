@@ -78,6 +78,11 @@ public:
     // construct an Extractor from network
     Extractor create_extractor() const;
 
+public:
+    int use_winograd_convolution;
+    int use_sgemm_convolution;
+    int use_int8_inference;
+
 protected:
     friend class Extractor;
 #if NCNN_STRING
@@ -87,7 +92,7 @@ protected:
     Layer* create_custom_layer(const char* type);
 #endif // NCNN_STRING
     Layer* create_custom_layer(int index);
-    int forward_layer(int layer_index, std::vector<Mat>& blob_mats, bool lightmode) const;
+    int forward_layer(int layer_index, std::vector<Mat>& blob_mats, Option& opt) const;
 
 protected:
     std::vector<Blob> blobs;
@@ -108,6 +113,12 @@ public:
     // this will overwrite the global setting
     // default count is system depended
     void set_num_threads(int num_threads);
+
+    // set blob memory allocator
+    void set_blob_allocator(Allocator* allocator);
+
+    // set workspace memory allocator
+    void set_workspace_allocator(Allocator* allocator);
 
 #if NCNN_STRING
     // set input by blob name
@@ -134,8 +145,7 @@ protected:
 private:
     const Net* net;
     std::vector<Mat> blob_mats;
-    bool lightmode;
-    int num_threads;
+    Option opt;
 };
 
 } // namespace ncnn

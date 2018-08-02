@@ -23,12 +23,13 @@ class ConvolutionDepthWise : public Layer
 {
 public:
     ConvolutionDepthWise();
+    ~ConvolutionDepthWise();
 
     virtual int load_param(const ParamDict& pd);
 
     virtual int load_model(const ModelBin& mb);
 
-    virtual int forward(const Mat& bottom_blob, Mat& top_blob) const;
+    virtual int forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
 
 public:
     // param
@@ -45,10 +46,16 @@ public:
 
     int weight_data_size;
     int group;
+    float weight_data_int8_scale;
 
     // model
     Mat weight_data;
     Mat bias_data;
+
+    bool use_int8_inference;
+
+    ncnn::Layer* quantize;
+    ncnn::Layer* dequantize;
 };
 
 } // namespace ncnn
